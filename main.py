@@ -1,3 +1,4 @@
+# a whole lotta imports
 import os
 import inference
 import supervision as sv
@@ -7,6 +8,13 @@ import torch
 from transformers import AutoProcessor, SiglipVisionModel
 from more_itertools import chunked
 import numpy as np
+import umap
+from sklearn.cluster import KMeans
+from sports.common.team import TeamClassifier
+
+os.environ['ONNXRUNTIME_EXECUTION_PROVIDERS'] = "[AzureExecutionProvider]"
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+PLAYER_ID = 2
 
 def install_dependencies()->None:
     # works in a CUDA enabled GPU environment
@@ -31,7 +39,7 @@ def get_roboflow_model():
     PLAYER_DETECTION_MODEL = inference.get_model(model_id=PLAYER_DETECTION_MODEL_ID, api_key=ROBOFLOW_API_KEY)
     return PLAYER_DETECTION_MODEL
 
-def supervision_utilities():
+def get_annotators():
     # colors for classes: ball, gk, outfield, ref
     # box_annotator = sv.BoxAnnotator(color=sv.ColorPalette.from_hex(['#ffffff', '#00BFFF', '#FF1493', '#FFD700']), thickness=2)
     label_annotator = sv.LabelAnnotator(color=sv.ColorPalette.from_hex(['#00BFFF', '#FF1493', '#FFD700']), text_color=sv.Color.from_hex('#000000'), text_position=sv.Position.BOTTOM_CENTER)
@@ -72,7 +80,6 @@ def get_tracker():
 
 def extract_crops(source_video_path:str, player_detection_model)->list:
     STRIDE = 30
-    PLAYER_ID = 2
     frame_generator = sv.get_video_frames_generator(source_video_path, stride = STRIDE)
     crops = []
     for frame in tqdm(frame_generator, desc="skipping frames and colecting crops"):
@@ -84,6 +91,7 @@ def extract_crops(source_video_path:str, player_detection_model)->list:
             sv.crop_image(frame, xyxy) for xyxy in detections.xyxy
         ]
     
+    # sv.plot_images_grid(crops[:100], grid_size=(10, 10))
     return crops
 
 def get_siglip():
@@ -94,47 +102,7 @@ def get_siglip():
     EMBEDDINGS_PROCESSOR = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
     return EMBEDDINGS_MODEL, EMBEDDINGS_PROCESSOR
 
-def main():
-    os.environ['ONNXRUNTIME_EXECUTION_PROVIDERS'] = "[AzureExecutionProvider]"
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # download_vids() # done
-    # full_vid_detection('vids\\full_obj_detection.mp4')
-    
-    # obj detection with triangle and ellipse annotators
-    SOURCE_VIDEO_PATH = 'vids\\0bfacc_0.mp4'
-    TARGET_VIDEO_PATH = 'ops\\0bfacc_0.mp4'
-    BALL_ID = 0 # class id for ball class
-
-    frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH, start = 200)
-    frame = next(frame_generator)
-    
-    # init tracker
-    tracker = get_tracker()
-    # init obj detection model
-    player_detection_model = get_roboflow_model()
-    # result = player_detection_model.infer(frame, confidence=0.3)[0]
-    # detections = sv.Detections.from_inference(result)
-    # ball_detections = detections[detections.class_id == BALL_ID]
-    # to expand a bounding box by some pixels:
-    # ball_detections.xyxy = sv.pad_boxes(xyxy = ball_detections.xyxy, px=10)
-    # all_detections = detections[detections.class_id != BALL_ID]
-    # all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
-    # all_detections.class_id = all_detections.class_id-1 # since class 0 is taken care of by the ellipse annotator
-    # all_detections = tracker.update_with_detections(all_detections)
-
-    # labels = [f"{tracker_id}" for tracker_id in all_detections.tracker_id]
-
-    # ellipse_annotator, triangle_annotator, label_annotator = supervision_utilities()
-    # # annotation
-    # annotated_frame = frame.copy()
-    # annotated_frame = triangle_annotator.annotate(scene=annotated_frame, detections=all_detections)
-    # annotated_frame = ellipse_annotator.annotate(scene=annotated_frame, detections=ball_detections)
-    # annotated_frame = label_annotator.annotate(annotated_frame, all_detections, labels)
-    # sv.plot_image(annotated_frame)
-
-    crops = extract_crops(SOURCE_VIDEO_PATH, player_detection_model)
-    # sv.plot_images_grid(crops[:100], grid_size=(10, 10))
-
+def get_embeddings(crops):
     # getting embeddings from crops using siglip
     # sv uses opencv as its engine while siglip uses pillow, so we'll convert crops into a format that is suitable
     crops = [sv.cv2_to_pillow(crop) for crop in crops]
@@ -151,6 +119,71 @@ def main():
     data = np.concatenate(data)
     print(data.shape)
     print(len(data))
+    return data
+
+def classifyTeams(data, crops):
+    # using umap to reduce dimensionality into 3d space and then use kmeans to get 2 clusters - teams
+    REDUCER = umap.UMAP(n_components=3)
+    CLUSTERING_MODEL = KMeans(n_clusters=2)
+    projections = REDUCER.fit_transform(data) # trains umap
+    clusters = CLUSTERING_MODEL.fit_predict(projections)
+    # print(clusters[:10])
+
+    team_0 = [crop for crop, cluster in zip(crops, clusters) if cluster == 0]
+    team_1 = [crop for crop, cluster in zip(crops, clusters) if cluster == 1]
+    # sv.plot_images_grid(team_0[:100], grid_size=(10,10))
+    return team_0, team_1
+
+def main():
+    # download_vids() # done
+    # full_vid_detection('vids\\full_obj_detection.mp4') # detection on all frames - slow
+    
+    # obj detection with triangle and ellipse annotators
+    SOURCE_VIDEO_PATH = 'vids\\0bfacc_0.mp4'
+    TARGET_VIDEO_PATH = 'ops\\0bfacc_0.mp4'
+    BALL_ID = 0 # class id for ball class
+    
+    # init obj detection model
+    player_detection_model = get_roboflow_model()
+    crops = extract_crops(SOURCE_VIDEO_PATH, player_detection_model) # gets you a list of crops of bounding boxes detected by the model, iterates over the file with some stride
+    team_classifier = TeamClassifier(device=DEVICE)
+    team_classifier.fit(crops)
+    
+    # init tracker
+    tracker = get_tracker()
+
+    frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH, start = 200)
+    frame = next(frame_generator)
+
+    result = player_detection_model.infer(frame, confidence=0.3)[0]
+    detections = sv.Detections.from_inference(result)
+
+    ball_detections = detections[detections.class_id == BALL_ID]
+    ball_detections.xyxy = sv.pad_boxes(xyxy = ball_detections.xyxy, px=10) # to expand a bounding box by some pixels
+
+    all_detections = detections[detections.class_id != BALL_ID]
+    all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
+    # all_detections.class_id = all_detections.class_id-1 # since class 0 is taken care of by the ellipse annotator
+    all_detections = tracker.update_with_detections(all_detections)
+
+    players_detections = all_detections[all_detections.class_id == PLAYER_ID]
+    players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
+    players_detections.class_id = team_classifier.predict(players_crops)
+
+    labels = [f"{tracker_id}" for tracker_id in players_detections.tracker_id]
+
+    ellipse_annotator, triangle_annotator, label_annotator = get_annotators()
+    # annotation
+    annotated_frame = frame.copy()
+    annotated_frame = triangle_annotator.annotate(scene=annotated_frame, detections=players_detections)
+    annotated_frame = ellipse_annotator.annotate(scene=annotated_frame, detections=ball_detections)
+    annotated_frame = label_annotator.annotate(annotated_frame, players_detections, labels)
+    sv.plot_image(annotated_frame)
+
+    # code for classifying teams - TeamClassifiern does the same shit
+    # data = get_embeddings(crops)
+    # team_0, team_1 = classifyTeams(data, crops)
+    
 
 
 if __name__=='__main__':
