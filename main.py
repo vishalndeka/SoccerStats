@@ -14,7 +14,10 @@ from sports.common.team import TeamClassifier
 
 os.environ['ONNXRUNTIME_EXECUTION_PROVIDERS'] = "[AzureExecutionProvider]"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+REFEREE_ID = 3
 PLAYER_ID = 2
+GOALKEEPER_ID = 1
+BALL_ID = 0 # class id for ball class
 
 def install_dependencies()->None:
     # works in a CUDA enabled GPU environment
@@ -134,6 +137,22 @@ def classifyTeams(data, crops):
     # sv.plot_images_grid(team_0[:100], grid_size=(10,10))
     return team_0, team_1
 
+def resolve_goalkeepers(players_detections: sv.Detections, goalkeepers_detections: sv.Detections):
+    # goalkeepers are classified into their teams via closeness to the average position of players of a team. the goalkeeper will be classified into the team its closest too
+    goalkeepers_xy = goalkeepers_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+    players_xy = players_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+
+    team_0_centroid = players_xy[players_detections.class_id == 0].mean(axis=0)
+    team_1_centroid = players_xy[players_detections.class_id == 1].mean(axis=0)
+    
+    goalkeepers_team_ids = []
+    for goalkeeper_xy in goalkeepers_xy:
+        dist_0 = np.linalg.norm(goalkeeper_xy - team_0_centroid)
+        dist_1 = np.linalg.norm(goalkeeper_xy - team_1_centroid)
+        goalkeepers_team_ids.append(0 if dist_0 < dist_1 else 1)
+
+    return np.array(goalkeepers_team_ids)
+
 def main():
     # download_vids() # done
     # full_vid_detection('vids\\full_obj_detection.mp4') # detection on all frames - slow
@@ -141,7 +160,6 @@ def main():
     # obj detection with triangle and ellipse annotators
     SOURCE_VIDEO_PATH = 'vids\\0bfacc_0.mp4'
     TARGET_VIDEO_PATH = 'ops\\0bfacc_0.mp4'
-    BALL_ID = 0 # class id for ball class
     
     # init obj detection model
     player_detection_model = get_roboflow_model()
@@ -161,23 +179,33 @@ def main():
     ball_detections = detections[detections.class_id == BALL_ID]
     ball_detections.xyxy = sv.pad_boxes(xyxy = ball_detections.xyxy, px=10) # to expand a bounding box by some pixels
 
+    # all detections other than ball
     all_detections = detections[detections.class_id != BALL_ID]
     all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
     # all_detections.class_id = all_detections.class_id-1 # since class 0 is taken care of by the ellipse annotator
     all_detections = tracker.update_with_detections(all_detections)
 
     players_detections = all_detections[all_detections.class_id == PLAYER_ID]
+    goalkeeper_detections = all_detections[all_detections.class_id == GOALKEEPER_ID]
+    referees_detections = all_detections[all_detections.class_id == REFEREE_ID]
+
     players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
     players_detections.class_id = team_classifier.predict(players_crops)
 
-    labels = [f"{tracker_id}" for tracker_id in players_detections.tracker_id]
+    # resolving goalkeeper class and merging into player detection
+    goalkeeper_detections.class_id = resolve_goalkeepers(players_detections, goalkeeper_detections)
+    referees_detections.class_id -= 1
+    all_detections = sv.Detections.merge([players_detections, goalkeeper_detections, referees_detections])
+    
+
+    labels = [f"{tracker_id}" for tracker_id in all_detections.tracker_id]
 
     ellipse_annotator, triangle_annotator, label_annotator = get_annotators()
     # annotation
     annotated_frame = frame.copy()
-    annotated_frame = triangle_annotator.annotate(scene=annotated_frame, detections=players_detections)
+    annotated_frame = triangle_annotator.annotate(scene=annotated_frame, detections=all_detections)
     annotated_frame = ellipse_annotator.annotate(scene=annotated_frame, detections=ball_detections)
-    annotated_frame = label_annotator.annotate(annotated_frame, players_detections, labels)
+    annotated_frame = label_annotator.annotate(annotated_frame, all_detections, labels)
     sv.plot_image(annotated_frame)
 
     # code for classifying teams - TeamClassifiern does the same shit
