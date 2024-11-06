@@ -11,8 +11,11 @@ import numpy as np
 import umap
 from sklearn.cluster import KMeans
 from sports.common.team import TeamClassifier
+from sports.configs.soccer import SoccerPitchConfiguration
+from sports.annotators.soccer import draw_pitch
 
 os.environ['ONNXRUNTIME_EXECUTION_PROVIDERS'] = "[AzureExecutionProvider]"
+ROBOFLOW_API_KEY = "DDHT1BYoK31ZfxKztjET" # keep this private
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 REFEREE_ID = 3
 PLAYER_ID = 2
@@ -37,10 +40,14 @@ def download_vids()->None:
     os.system('gdown -O "121364_0.mp4" "https://drive.google.com/uc?id=1vVwjW1dE1drIdd4ZSILfbCGPD4weoNiu"')
 
 def get_roboflow_model():
-    ROBOFLOW_API_KEY = "DDHT1BYoK31ZfxKztjET" # keep this private
     PLAYER_DETECTION_MODEL_ID = "football-players-detection-3zvbc/11"
     PLAYER_DETECTION_MODEL = inference.get_model(model_id=PLAYER_DETECTION_MODEL_ID, api_key=ROBOFLOW_API_KEY)
     return PLAYER_DETECTION_MODEL
+
+def get_keypoint_detection_model():
+    PITCH_DETECTION_MODEL_ID = "football-field-detection-f07vi/14"
+    PITCH_DETECTION_MODEL = inference.get_model(PITCH_DETECTION_MODEL_ID, ROBOFLOW_API_KEY)
+    return PITCH_DETECTION_MODEL
 
 def get_annotators():
     # colors for classes: ball, gk, outfield, ref
@@ -221,7 +228,7 @@ def main():
     
     # ------------------------------------------------------------------------------
     # obj detection with triangle and ellipse annotators
-    # SOURCE_VIDEO_PATH = 'vids\\0bfacc_0.mp4'
+    SOURCE_VIDEO_PATH = 'vids\\0bfacc_0.mp4'
     # TARGET_VIDEO_PATH = 'ops\\0bfacc_0.mp4'
     
     # # init obj detection model
@@ -278,6 +285,31 @@ def main():
     # data = get_embeddings(crops)
     # team_0, team_1 = classifyTeams(data, crops)
     # full_detection_tracking("vids\\0bfacc_0.mp4")
+
+
+    # pitch key point detection
+    vertex_annotator = sv.VertexAnnotator(color = sv.Color.from_hex('#ff1493'), radius=8)
+    pitch_keypoint_detection_model = get_keypoint_detection_model()
+    frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH)
+    frame = next(frame_generator)
+    result = pitch_keypoint_detection_model.infer(frame, confidence=0.3)[0]
+    key_points = sv.KeyPoints.from_inference(result)
+
+    # filtering key points on anchor point confidence to get rid of random key points on the pitch
+    filter = key_points.confidence[0]>0.5
+    frame_reference_points = key_points.xy[0][filter]
+    frame_reference_key_points = sv.KeyPoints(xy=frame_reference_points[np.newaxis, ...])
+
+    
+    annotated_frame = frame.copy()
+    annotated_frame = vertex_annotator.annotate(annotated_frame, frame_reference_key_points)
+    sv.plot_image(annotated_frame)
+    # do the above for all frames and you're good
+
+    # projecting pitch lines on a plane
+    CONFIG = SoccerPitchConfiguration()
+    annotated_frame = draw_pitch(CONFIG)
+    
     pass
     
 
